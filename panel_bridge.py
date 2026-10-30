@@ -471,7 +471,7 @@ def tps_view(db, now):
 
 
 def tps_title(view, now):
-    t = f"generation speed — tok/s ({view['label']}, via CPA)"
+    t = f"generation speed — tok/s ({view['label']}, latest (max))"
     if len(view["unlocked"]) > 1:
         t += " · click = zoom"
     if view["next_lock"]:
@@ -557,15 +557,14 @@ def render_charts(now, chart_dir, hours=DEFAULT_ZOOM, tdb=None, tps_hours=DEFAUL
     return total_png, speed_png, tps_png
 
 
-def current_tps(db, now):
-    """{provider: tok/s} — last 15 min, falling back to the last hour."""
-    recent = tf.provider_stats(db, now, 0.25)
-    hour = tf.provider_stats(db, now, 1)
+def tps_legend(db, now, hours):
+    """{provider: (latest tok/s, max tok/s)} over the chart window, from the
+    same buckets the chart draws, so the legend always matches the lines."""
     out = {}
-    for p in TOKEN_IDS:
-        tps = (recent.get(p) or {}).get("tps") or (hour.get(p) or {}).get("tps")
-        if tps:
-            out[p] = tps
+    for p, vals in tf.speed_series(db, hours, now).items():
+        real = [v for v in vals if v is not None]
+        if p in TOKEN_IDS and real:
+            out[p] = (real[-1], max(real))
     return out
 
 
@@ -593,11 +592,12 @@ def panel_payload(now):
     out["img_speed"] = str(speed_png)
     out["img_tps"] = str(tps_png)
     out["tps_title"] = tps_title(view, now)
-    tps = current_tps(tdb, now)
+    tps = tps_legend(tdb, now, view["hours"])
     if tdb:
         tdb.close()
     for p in TOKEN_IDS:
-        out[f"{p}_tps"] = f"{TOKEN_LABELS[p]} {tps[p]:.0f}t/s" if p in tps else ""
+        out[f"{p}_tps"] = (
+            f"{TOKEN_LABELS[p]} {tps[p][0]:.0f}t/s ({tps[p][1]:.0f})" if p in tps else "")
     out["clock"] = time.strftime("%H:%M:%S")
     return out
 
