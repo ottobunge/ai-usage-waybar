@@ -1,0 +1,13 @@
+{
+  "mode": "all",
+  "providers": {
+    "cursor": false
+  },
+  "panel": {"monitor": 0, "height": 1080},
+  "notify": {
+    "enabled": true,
+    "quota_warn_pct": 80,
+    "quota_crit_pct": 95,
+    "money_warn_below": 10.0
+  }
+}

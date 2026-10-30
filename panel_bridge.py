@@ -1,0 +1,571 @@
+#!/usr/bin/env python3
+"""panel_bridge — feeds the eww AI-usage panel (flicker-free design).
+
+The eww config (~/.config/eww/eww.yuck) is a STATIC skeleton written once by
+`panel_bridge.py --write-yuck`. It declares ONE defpoll that runs
+`panel_bridge.py --emit panel_data` every 2s; that emits a flat JSON object
+with preformatted fields per provider plus the absolute paths of two freshly
+rendered chart PNGs (timestamped filenames so the image widgets reload
+without eww recreating the window — that recreation was the flicker).
+
+Usage:
+  panel_bridge.py --write-yuck        render + install the static eww.yuck
+  panel_bridge.py --cycle-zoom        cycle the quota charts' window
+  panel_bridge.py --cycle-tps-zoom    cycle the tok/s chart's window (default 4h)
+  panel_bridge.py --emit panel_data   print the live JSON (called by eww)
+  panel_bridge.py --once              print the yuck skeleton to stdout
+"""
+import json
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ai_usage_waybar as m  # noqa: E402  (fmt_in)
+import tokenflow as tf  # noqa: E402  (CPA token-flow store)
+
+HOME = Path.home()
+CACHE = HOME / ".cache/ai-usage-waybar"
+CONFIG = HOME / ".config/ai-usage-waybar/config.json"
+PLANS = HOME / ".config/ai-usage-waybar/plans.json"
+YUCK = HOME / ".config/eww/eww.yuck"
+BRIDGE = Path(__file__).resolve()
+ZOOM_FILE = CACHE / "zoom"
+ZOOM_LEVELS = [(3, "3h"), (6, "6h"), (12, "12h"), (36, "36h"),
+               (72, "3d"), (168, "7d")]
+DEFAULT_ZOOM = 12  # hours — chart window default
+# The tok/s chart has its own window: generation speed is a short-horizon
+# signal, so it defaults to 4h and cycles independently of the quota charts.
+TPS_ZOOM_FILE = CACHE / "tps-zoom"
+TPS_ZOOM_LEVELS = [(1, "1h"), (2, "2h"), (4, "4h"), (8, "8h"), (24, "24h")]
+DEFAULT_TPS_ZOOM = 4
+PANEL_IDS = ["anthropic", "codex", "zai", "kimi", "minimax", "deepseek"]
+PANEL_LABELS = {"anthropic": "Claude", "codex": "Codex", "zai": "Z.AI",
+                "kimi": "Kimi", "minimax": "MiniMax", "deepseek": "DeepSeek"}
+PROVIDER_COLORS = {
+    "anthropic": (243, 139, 168), "codex": (148, 226, 213), "zai": (203, 166, 247),
+    "kimi": (249, 226, 175), "minimax": (166, 227, 161), "deepseek": (137, 180, 250),
+}
+# Token-flow providers: the quota providers plus gateway-only ones (no plan quota).
+TOKEN_IDS = PANEL_IDS + ["openrouter"]
+TOKEN_LABELS = dict(PANEL_LABELS, openrouter="OpenRouter")
+TOKEN_COLORS = dict(PROVIDER_COLORS, openrouter=(250, 179, 135))
+
+
+def load_json(path):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
+
+
+def worst_pct(item):
+    vals = [w[1] for w in item.get("windows", []) if w[1] is not None]
+    return max(vals) if vals else None
+
+
+def burn_pct_h(samples, pid, now, hours):
+    """%/h measured within the current post-reset monotonic segment of the
+    lookback window; None when that segment is too short to be meaningful."""
+    pool = sorted(samples, key=lambda s: s[0])
+    pts = []
+    for ts, recs in pool:
+        if ts > now or now - ts > (hours + 1) * 3600:
+            continue
+        wins = recs.get(pid)
+        if not wins:
+            continue
+        v = next((v for v in wins.values() if v is not None), None)
+        if v is not None:
+            pts.append((ts, v))
+    if len(pts) < 2:
+        return None
+    seg = split_at_resets(pts)[-1]
+    dt_h = (seg[-1][0] - seg[0][0]) / 3600
+    if dt_h < 1 / 60:
+        return None
+    return (seg[-1][1] - seg[0][1]) / dt_h
+
+
+def reset_in(item):
+    epochs = [w[3] for w in item.get("windows", []) if len(w) > 3 and w[3]]
+    if not epochs:
+        return ""
+    return m.fmt_in(min(epochs))
+
+
+def cost_stats(pid, worst, burn_1h, plans):
+    plan = (plans or {}).get(pid) or {}
+    cost = plan.get("cost")
+    if not cost:
+        return ""
+    days = plan.get("period_days", 30)
+    per_pct = cost / 100.0
+    used = (worst or 0) / 100.0 * cost
+    rate = (burn_1h or 0) * per_pct
+    proj = rate * 24
+    parts = [f"${used:,.2f} of ${cost:,.2f}/{days}d"]
+    if rate > 0:
+        parts.append(f"${rate:,.2f}/h → ${proj:,.2f}/d")
+        if (burn_1h or 0) > 0:
+            parts.append(f"{100 / burn_1h:,.0f}h to 100% (${cost - used:,.2f} left)")
+    return "  ·  ".join(parts)
+
+
+def esc(s):
+    return s.replace('"', "'")
+
+
+def card_fields(pid, label, item, samples, plans, now):
+    """Preformatted display fields for one provider."""
+    level = (item or {}).get("level", "off")
+    kind = (item or {}).get("kind", "quota")
+    f = {"label": label, "klass": f"card {level}", "pct": "?", "bar": 0,
+         "reset": "", "info": ""}
+    err = (item or {}).get("error")
+    if err:
+        f.update(pct="err", info=str(err))
+        return f
+    wins = [(w[0], w[1]) for w in item.get("windows", [])]
+    info = []
+    if kind == "money":
+        bal = next((v for _, v in wins if isinstance(v, (int, float))), None)
+        cur = (item or {}).get("currency", "USD")
+        sym = {"USD": "$", "EUR": "€"}.get(cur, cur + " ")
+        f["pct"] = f"{sym}{bal:,.2f}" if bal is not None else "?"
+    else:
+        worst = worst_pct(item)
+        f["pct"] = f"{worst:.0f}%"
+        f["bar"] = int(worst or 0)
+        rin = reset_in(item)
+        if rin:
+            left = 100 - (worst or 0)
+            f["reset"] = f"resets in {rin} · {left:.0f}% left"
+        info.append("  ·  ".join(f"{w[0]} {w[1]:.0f}%" for w in item.get("windows", [])
+                                 if w[1] is not None))
+        b1 = burn_pct_h(samples, pid, now, 1)
+        b24 = burn_pct_h(samples, pid, now, 24)
+        burns = []
+        if b1 is not None:
+            burns.append(f"{b1:+.1f}%/h")
+        if b24 is not None:
+            burns.append(f"24h {b24:+.0f}%")
+        if burns:
+            info.append("  ·  ".join(burns))
+        c = cost_stats(pid, worst, b1, plans)
+        if c:
+            info.append(c)
+    for lbl, used, total in item.get("counts") or []:
+        if used is None:
+            continue
+        fu = f"{used:,}" if isinstance(used, int) else used
+        ft = f"/{total:,}" if isinstance(total, int) and total else ""
+        info.append(f"{lbl}: {fu}{ft}")
+    info.extend(item.get("extra") or [])
+    f["info"] = "\n".join(x for x in info if x)
+    return f
+
+
+def build_series(samples, hourly, now, hours=DEFAULT_ZOOM):
+    """Summed-across-providers series as [(ts, value)] plus its speed."""
+    pool = sorted((samples or []) + (hourly or []), key=lambda s: s[0])
+    recent = [s for s in pool if now - s[0] <= hours * 3600]
+    pts = []
+    for ts, recs in recent:
+        vals = []
+        for pid, wins in recs.items():
+            v = next((v for v in wins.values() if v is not None), None)
+            if v is not None:
+                vals.append(v)
+        if vals:
+            pts.append((ts, sum(vals)))
+    if len(pts) < 2:
+        return [], []
+    step = max(len(pts) // 160, 1)
+    kept = pts[::step]
+    if kept[-1][0] != pts[-1][0]:
+        kept.append(pts[-1])
+    return kept, speed_from_pts(kept)
+
+
+def provider_series(samples, hourly, pid, now, hours=DEFAULT_ZOOM):
+    """[(ts, worst-window-pct)] for one provider over the lookback window."""
+    pool = sorted((samples or []) + (hourly or []), key=lambda s: s[0])
+    pts = []
+    for ts, recs in pool:
+        if now - ts > hours * 3600:
+            continue
+        wins = recs.get(pid)
+        if not wins:
+            continue
+        vals = [v for v in wins.values() if v is not None]
+        if vals:
+            pts.append((ts, max(vals)))
+    return pts
+
+
+def split_at_resets(pts):
+    """[(ts, v)] -> list of monotonically non-decreasing segments; a usage
+    reset (value drop) starts a new segment instead of a fake -100%/h cliff."""
+    segs, cur = [], []
+    for p in pts:
+        if cur and p[1] < cur[-1][1]:
+            segs.append(cur)
+            cur = []
+        cur.append(p)
+    if cur:
+        segs.append(cur)
+    return segs
+
+
+def speed_from_pts(pts, max_points=160):
+    """/h derivative of a [(ts, value)] series. The series is downsampled to
+    ~max_points first so intervals are minutes-wide (45 s raw sampling would
+    both skip the dt gate and produce rounding-jitter spikes); intervals
+    spanning a usage reset (value drop) are skipped rather than counted as
+    -N%/h."""
+    step = max(len(pts) // max_points, 1)
+    kept = pts[::step]
+    if kept[-1][0] != pts[-1][0]:
+        kept.append(pts[-1])
+    speed = []
+    for i in range(1, len(kept)):
+        dt_h = (kept[i][0] - kept[i - 1][0]) / 3600
+        delta = kept[i][1] - kept[i - 1][1]
+        if dt_h >= 1 / 120 and delta >= 0:
+            speed.append(round(delta / dt_h, 2))
+    return speed
+
+
+# --- tiny 3x5 pixel font for chart axis labels -------------------------------
+FONT = {
+    "0": ["XXX", "X.X", "X.X", "X.X", "XXX"],
+    "1": [".X.", "XX.", ".X.", ".X.", "XXX"],
+    "2": ["XXX", "..X", "XXX", "X..", "XXX"],
+    "3": ["XXX", "..X", "XXX", "..X", "XXX"],
+    "4": ["X.X", "X.X", "XXX", "..X", "..X"],
+    "5": ["XXX", "X..", "XXX", "..X", "XXX"],
+    "6": ["XXX", "X..", "XXX", "X.X", "XXX"],
+    "7": ["XXX", "..X", "..X", "..X", "..X"],
+    "8": ["XXX", "X.X", "XXX", "X.X", "XXX"],
+    "9": ["XXX", "X.X", "XXX", "..X", "XXX"],
+    "%": ["X.X", "..X", ".X.", "X..", "X.X"],
+    "/": ["..X", "..X", ".X.", "X..", "X.."],
+    "h": ["X..", "X..", "XXX", "X.X", "X.X"],
+    "$": [".X.", "XXX", "X..", "XXX", ".X."],
+    "-": ["...", "...", "XXX", "...", "..."],
+    ".": ["...", "...", "...", "...", ".X."],
+    "k": ["X..", "X.X", "XX.", "X.X", "X.X"],
+    "t": [".X.", "XXX", ".X.", ".X.", ".XX"],
+    "s": [".XX", "X..", ".X.", "..X", "XX."],
+    "m": ["...", "...", "X.X", "XXX", "X.X"],
+    ":": ["...", ".X.", "...", ".X.", "..."],
+    " ": ["...", "...", "...", "...", "..."],
+}
+
+
+def draw_text(rows, x, y, text, rgb, scale=2):
+    for ci, ch in enumerate(text):
+        glyph = FONT.get(ch.lower() if ch not in FONT else ch)
+        if glyph is None:
+            continue
+        for gy, grow in enumerate(glyph):
+            for gx, gch in enumerate(grow):
+                if gch != "X":
+                    continue
+                for dy in range(scale):
+                    for dx in range(scale):
+                        px, py = x + (ci * 4 + gx) * scale + dx, y + gy * scale + dy
+                        if 0 <= px < len(rows[0]) and 0 <= py < len(rows):
+                            rows[py][px] = rgb
+
+
+def write_png(path, w, h, rgb_rows):
+    """Minimal stdlib PNG writer: rgb_rows = list of (r, g, b) tuples per pixel."""
+    import struct
+    import zlib
+
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    raw = b"".join(b"\x00" + bytes(v for px in row for v in px) for row in rgb_rows)
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, 6))
+           + chunk(b"IEND", b""))
+    Path(path).write_bytes(png)
+
+
+def draw_multi_chart(series, out_path, w, h, fill=False, unit="%",
+                     ymin=None, ymax=None):
+    """series: list of (values, rgb). Draws 0/mid/max gridlines labelled with
+    the unit using the tiny font."""
+    pad_l, pad_r, pad_t, pad_b = 48, 4, 8, 6
+    all_vals = [v for vals, _ in series for v in vals] or [0, 0]
+    lo = ymin if ymin is not None else min(all_vals)
+    hi = ymax if ymax is not None else max(all_vals)
+    if hi - lo < 1e-9:
+        hi = lo + 1
+    rows = [[(30, 32, 46)] * w for _ in range(h)]
+    for frac in (0.0, 0.5, 1.0):
+        y = pad_t + round((h - pad_t - pad_b) * (1 - frac))
+        for xx in range(pad_l, w - pad_r):
+            rows[y][xx] = (49, 50, 68)
+        val = lo + (hi - lo) * frac
+        draw_text(rows, 2, y - 5, f"{val:.0f}{unit}", (166, 173, 200), scale=2)
+
+    def to_pts(vals):
+        n = max(len(vals), 2)
+        return [(pad_l + round(i * (w - pad_l - pad_r - 1) / (n - 1)),
+                 pad_t + round((h - pad_t - pad_b) * (1 - (v - lo) / (hi - lo))))
+                for i, v in enumerate(vals)]
+
+    for vals, rgb in series:
+        if len(vals) < 2:
+            vals = (vals or [0]) + [0]
+        pts = to_pts(vals)
+        if fill and len(series) == 1:  # area fill only for single-series charts
+            for i, (x, y) in enumerate(pts):
+                x2 = pts[i + 1][0] if i + 1 < len(pts) else w - pad_r - 1
+                for xx in range(x, min(x2 + 1, w)):
+                    for yy in range(y, h - pad_b):
+                        rows[yy][xx] = (rgb[0] // 6 + 18, rgb[1] // 6 + 18, rgb[2] // 6 + 22)
+        for i in range(len(pts) - 1):
+            (x0, y0), (x1, y1) = pts[i], pts[i + 1]
+            steps = max(abs(x1 - x0), abs(y1 - y0), 1)
+            for s in range(steps + 1):
+                xx = round(x0 + (x1 - x0) * s / steps)
+                yy = round(y0 + (y1 - y0) * s / steps)
+                for dy in (-1, 0, 1):
+                    if 0 <= yy + dy < h:
+                        rows[yy + dy][xx] = rgb
+    write_png(out_path, w, h, rows)
+
+
+def read_zoom():
+    try:
+        hours = int(ZOOM_FILE.read_text().strip())
+        return hours if any(h == hours for h, _ in ZOOM_LEVELS) else DEFAULT_ZOOM
+    except Exception:
+        return DEFAULT_ZOOM
+
+
+def read_tps_zoom():
+    try:
+        hours = int(TPS_ZOOM_FILE.read_text().strip())
+        return hours if any(h == hours for h, _ in TPS_ZOOM_LEVELS) else DEFAULT_TPS_ZOOM
+    except Exception:
+        return DEFAULT_TPS_ZOOM
+
+
+def tps_zoom_label(hours):
+    return next((lbl for h, lbl in TPS_ZOOM_LEVELS if h == hours), f"{hours}h")
+
+
+def zoom_label(hours):
+    return next((lbl for h, lbl in ZOOM_LEVELS if h == hours), f"{hours}h")
+
+
+def chart_series(now, hours=DEFAULT_ZOOM):
+    state = load_json(CACHE / "state.json") or {}
+    samples = state.get("usage_samples") or []
+    hourly = state.get("usage_samples_hourly")
+    total_pts, _ = build_series(samples, hourly, now, hours)
+    usage, speeds = [], []
+    for p in PANEL_IDS:
+        pts = provider_series(samples, hourly, p, now, hours)
+        if len(pts) >= 2:
+            for seg in split_at_resets(pts):  # one line per post-reset segment
+                usage.append(([v for _, v in seg], PROVIDER_COLORS[p]))
+            sp = speed_from_pts(pts)
+            if len(sp) >= 2:
+                speeds.append((sp, PROVIDER_COLORS[p]))
+    for seg in split_at_resets(total_pts):  # summed total, reset-aware
+        usage.append(([round(v, 1) for _, v in seg], (235, 235, 245)))
+    if speeds:
+        speeds.append((speed_from_pts(total_pts), (166, 227, 161)))
+    return usage, speeds
+
+
+def token_speed_series(db, now, hours=DEFAULT_ZOOM):
+    """[(tok/s values, rgb)] per provider with >= 2 buckets of streamed traffic."""
+    by_provider = tf.speed_series(db, hours, now)
+    return [(by_provider[p], TOKEN_COLORS[p]) for p in TOKEN_IDS
+            if len(by_provider.get(p, [])) >= 2]
+
+
+def render_charts(now, chart_dir, hours=DEFAULT_ZOOM):
+    """Render the charts to timestamped files; prune old; return the paths."""
+    chart_dir.mkdir(parents=True, exist_ok=True)
+    usage, speeds = chart_series(now, hours)
+    ts = int(now)
+    total_png = chart_dir / f"total-{ts}.png"
+    speed_png = chart_dir / f"speed-{ts}.png"
+    tps_png = chart_dir / f"tps-{ts}.png"
+    draw_multi_chart(usage, total_png, 610, 120, unit="%", ymin=0)
+    draw_multi_chart(speeds, speed_png, 610, 90, unit="%/h")
+    db = tf.connect(readonly=True)
+    draw_multi_chart(token_speed_series(db, now, read_tps_zoom()), tps_png, 610, 90,
+                     unit="t/s", ymin=0)
+    if db:
+        db.close()
+    for prefix in ("total-", "speed-", "tps-"):
+        olds = sorted(chart_dir.glob(prefix + "*.png"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in olds[2:]:
+            old.unlink(missing_ok=True)
+    return total_png, speed_png, tps_png
+
+
+def current_tps(db, now):
+    """{provider: tok/s} — last 15 min, falling back to the last hour."""
+    recent = tf.provider_stats(db, now, 0.25)
+    hour = tf.provider_stats(db, now, 1)
+    out = {}
+    for p in TOKEN_IDS:
+        tps = (recent.get(p) or {}).get("tps") or (hour.get(p) or {}).get("tps")
+        if tps:
+            out[p] = tps
+    return out
+
+
+def panel_payload(now):
+    state = load_json(CACHE / "state.json") or {}
+    plans = load_json(PLANS) or {}
+    samples = state.get("usage_samples") or []
+    hourly = state.get("usage_samples_hourly")
+    hours = read_zoom()
+    out = {"range": zoom_label(hours)}
+    for p in PANEL_IDS:
+        item = load_json(CACHE / f"{p}.json")
+        item = item.get("data") if isinstance(item, dict) else None
+        f = card_fields(p, PANEL_LABELS[p], item, samples, plans, now)
+        for k, v in f.items():
+            out[f"{p}_{k}"] = v
+        pts = provider_series(samples, hourly, p, now, hours)
+        sp = speed_from_pts(pts) if len(pts) >= 2 else []
+        out[f"{p}_speed"] = f"{sp[-1]:+.1f}%/h" if sp else ""
+    total_png, speed_png, tps_png = render_charts(now, CACHE / "graphs", hours)
+    out["img_total"] = str(total_png)
+    out["img_speed"] = str(speed_png)
+    out["img_tps"] = str(tps_png)
+    out["tps_range"] = tps_zoom_label(read_tps_zoom())
+    db = tf.connect(readonly=True)
+    tps = current_tps(db, now)
+    if db:
+        db.close()
+    for p in TOKEN_IDS:
+        out[f"{p}_tps"] = f"{tps[p]:.0f}t/s" if p in tps else ""
+    out["clock"] = time.strftime("%H:%M:%S")
+    return out
+
+
+LEGEND = " ".join(
+    f'(box :orientation "h" :space-evenly false '
+    f'(box :class "ldot" :style "background-color: #{r:02x}{g:02x}{b:02x};") '
+    f'(label :class "lname" :text "{PANEL_LABELS[p]}"))'
+    for p, (r, g, b) in PROVIDER_COLORS.items())
+
+TPS_ROW = " ".join(
+    f'(label :class "lname" :style "color: #{r:02x}{g:02x}{b:02x}; margin-left: 12px;" '
+    f':text {{panel_data.{p}_tps}})'
+    for p, (r, g, b) in TOKEN_COLORS.items())
+
+SPEED_ROW = " ".join(
+    f'(label :class "lname" :style "color: #{r:02x}{g:02x}{b:02x}; margin-left: 12px;" '
+    f':text {{panel_data.{p}_speed}})'
+    for p, (r, g, b) in PROVIDER_COLORS.items())
+
+
+def panel_geometry():
+    """(monitor index, height px) from config.json "panel", else (0, 1080)."""
+    cfg = (load_json(CONFIG) or {}).get("panel") or {}
+    try:
+        return int(cfg.get("monitor", 0)), int(cfg.get("height", 1080))
+    except (TypeError, ValueError):
+        return 0, 1080
+
+
+def render_yuck(initial_json="{}"):
+    """The STATIC skeleton — written once, never rewritten while running."""
+    monitor, height = panel_geometry()
+    cards = []
+    for p in PANEL_IDS:
+        d = f"panel_data.{p}_"
+        cards.append(f"""  (box :class {{{d}klass}} :orientation "v" :space-evenly false
+    (box :orientation "h" :space-evenly false :hexpand true
+      (label :halign "start" :hexpand true :class "name" :text {{{d}label}})
+      (label :halign "end" :hexpand false :class "pct" :text {{{d}pct}}))
+    (progress :value {{{d}bar}} :max 100 :class "bar")
+    (label :halign "start" :class "reset" :text {{{d}reset}})
+    (label :halign "start" :class "info" :text {{{d}info}}))""")
+    return f"""
+(defpoll panel_data :interval "2s" :initial "{initial_json}" `{BRIDGE} --emit panel_data`)
+(defwindow ai-panel :monitor {monitor} :stacking "fg"
+  :geometry (geometry :x "0px" :y "0px" :width "640px" :height "{height}px" :anchor "top right")
+  (box :orientation "v" :space-evenly false :class "root"
+    (box :orientation "h" :space-evenly false :hexpand true
+      (label :halign "start" :class "title" :text "AI usage")
+      (label :halign "end" :hexpand false :class "clock"
+        :text {{panel_data.clock}}))
+    (scroll :vscroll true :hscroll false :vexpand true
+     (box :orientation "v" :space-evenly false :class "body"
+""" + "\n".join(cards) + f"""
+    (button :class "gtitle" :onclick "{BRIDGE} --cycle-zoom"
+      (label :halign "start" :class "gtitle"
+        :text "usage — ${{panel_data.range}}, worst window per provider · click = zoom"))
+    (box :orientation "h" :space-evenly false :class "legend" {LEGEND})
+    (box :class "graph" (image :path {{panel_data.img_total}} :image-width 610 :image-height 120))
+    (button :class "gtitle" :onclick "{BRIDGE} --cycle-zoom"
+      (label :halign "start" :class "gtitle"
+        :text "speed — %/h per provider (${{panel_data.range}}) · click = zoom"))
+    (box :class "graph" (image :path {{panel_data.img_speed}} :image-width 610 :image-height 90))
+    (box :orientation "h" :halign "end" :space-evenly false :class "legend" {SPEED_ROW})
+    (button :class "gtitle" :onclick "{BRIDGE} --cycle-tps-zoom"
+      (label :halign "start" :class "gtitle"
+        :text "generation speed — tok/s per provider (${{panel_data.tps_range}}, via CPA) · click = zoom"))
+    (box :class "graph" (image :path {{panel_data.img_tps}} :image-width 610 :image-height 90))
+    (box :orientation "h" :halign "end" :space-evenly false :class "legend" {TPS_ROW})))))
+"""
+
+
+def main():
+    argv = sys.argv[1:]
+    if "--write-yuck" in argv:
+        payload = panel_payload(time.time())  # real values become :initial
+        initial = json.dumps(payload, separators=(",", ":")).replace('"', '\\"')
+        YUCK.write_text(render_yuck(initial))
+        print(f"wrote {YUCK}")
+        return
+    if "--cycle-zoom" in argv:
+        levels = [h for h, _ in ZOOM_LEVELS]
+        cur = read_zoom()
+        nxt = levels[(levels.index(cur) + 1) % len(levels)]
+        ZOOM_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ZOOM_FILE.write_text(str(nxt))
+        print(f"zoom: {zoom_label(cur)} -> {zoom_label(nxt)}")
+        return
+    if "--cycle-tps-zoom" in argv:
+        levels = [h for h, _ in TPS_ZOOM_LEVELS]
+        cur = read_tps_zoom()
+        nxt = levels[(levels.index(cur) + 1) % len(levels)]
+        TPS_ZOOM_FILE.parent.mkdir(parents=True, exist_ok=True)
+        TPS_ZOOM_FILE.write_text(str(nxt))
+        print(f"tps zoom: {tps_zoom_label(cur)} -> {tps_zoom_label(nxt)}")
+        return
+    if "--emit" in argv:
+        name = argv[argv.index("--emit") + 1]
+        if name == "panel_data":
+            print(json.dumps(panel_payload(time.time()), separators=(",", ":")))
+        else:
+            print(json.dumps({}))
+        return
+    if "--once" in argv:
+        print(render_yuck())
+        return
+    print(__doc__)
+
+
+if __name__ == "__main__":
+    main()
