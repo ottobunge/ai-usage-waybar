@@ -298,11 +298,12 @@ def write_png(path, w, h, rgb_rows):
 
 
 def draw_multi_chart(series, out_path, w, h, fill=False, unit="%",
-                     ymin=None, ymax=None, dots=False):
+                     ymin=None, ymax=None, dots=False, max_gap=None):
     """series: list of (values, rgb). Draws 0/mid/max gridlines labelled with
     the unit using the tiny font. A value may be None (no sample in that slot):
     the line skips it, and with dots=True every real sample gets a marker so a
-    lone sample is still visible."""
+    lone sample is still visible. max_gap: samples more than this many slots
+    apart are not joined by a line (no implied trend across missing data)."""
     pad_l, pad_r, pad_t, pad_b = 48, 4, 8, 6
     all_vals = [v for vals, _ in series for v in vals if v is not None] or [0, 0]
     lo = ymin if ymin is not None else min(all_vals)
@@ -320,7 +321,7 @@ def draw_multi_chart(series, out_path, w, h, fill=False, unit="%",
     def to_pts(vals):
         n = max(len(vals), 2)
         return [(pad_l + round(i * (w - pad_l - pad_r - 1) / (n - 1)),
-                 pad_t + round((h - pad_t - pad_b) * (1 - (v - lo) / (hi - lo))))
+                 pad_t + round((h - pad_t - pad_b) * (1 - (v - lo) / (hi - lo))), i)
                 for i, v in enumerate(vals) if v is not None]
 
     for vals, rgb in series:
@@ -328,19 +329,21 @@ def draw_multi_chart(series, out_path, w, h, fill=False, unit="%",
             vals = (vals or [0]) + [0]
         pts = to_pts(vals)
         if dots:
-            for x, y in pts:
+            for x, y, _ in pts:
                 for dy in range(-2, 3):
                     for dx in range(-2, 3):
                         if 0 <= y + dy < h and 0 <= x + dx < w:
                             rows[y + dy][x + dx] = rgb
         if fill and len(series) == 1:  # area fill only for single-series charts
-            for i, (x, y) in enumerate(pts):
+            for i, (x, y, _) in enumerate(pts):
                 x2 = pts[i + 1][0] if i + 1 < len(pts) else w - pad_r - 1
                 for xx in range(x, min(x2 + 1, w)):
                     for yy in range(y, h - pad_b):
                         rows[yy][xx] = (rgb[0] // 6 + 18, rgb[1] // 6 + 18, rgb[2] // 6 + 22)
         for i in range(len(pts) - 1):
-            (x0, y0), (x1, y1) = pts[i], pts[i + 1]
+            (x0, y0, i0), (x1, y1, i1) = pts[i], pts[i + 1]
+            if max_gap is not None and i1 - i0 > max_gap:
+                continue  # too far apart to claim a trend: leave the dots alone
             steps = max(abs(x1 - x0), abs(y1 - y0), 1)
             for s in range(steps + 1):
                 xx = round(x0 + (x1 - x0) * s / steps)
@@ -447,7 +450,7 @@ def render_charts(now, chart_dir, hours=DEFAULT_ZOOM, tdb=None, tps_hours=DEFAUL
     draw_multi_chart(usage, total_png, 610, 120, unit="%", ymin=0)
     draw_multi_chart(speeds, speed_png, 610, 90, unit="%/h")
     draw_multi_chart(token_speed_series(tdb, now, tps_hours), tps_png, 610, 90,
-                     unit="t/s", ymin=0, dots=True)
+                     unit="t/s", ymin=0, dots=True, max_gap=4)
     for prefix in ("total-", "speed-", "tps-"):
         olds = sorted(chart_dir.glob(prefix + "*.png"),
                       key=lambda p: p.stat().st_mtime, reverse=True)
