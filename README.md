@@ -177,6 +177,9 @@ no prompts or keys; 30-day retention). Speed = output tokens / generation second
 (`latency - ttft`) over streamed, successful requests; non-stream requests count toward
 volume only. `aiq serve` adds `GET /tokens?hours=N` (totals plus tokens/min and tok/s series).
 The tok/s chart has its own window (default 4h; click its title to cycle 1h/2h/4h/8h/24h).
+Its x-axis always spans the history that exists, so zoom levels longer than the stored
+data stay locked (the title shows when the next one unlocks); with under an hour of
+data the window is simply all of it.
 A second collector waits on a lock instead of stealing records. The panel body scrolls,
 so the extra chart never overflows a short monitor.
 

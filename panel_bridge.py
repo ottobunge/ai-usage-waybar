@@ -371,6 +371,38 @@ def tps_zoom_label(hours):
     return next((lbl for h, lbl in TPS_ZOOM_LEVELS if h == hours), f"{hours}h")
 
 
+def tps_view(db, now):
+    """Effective window for the tok/s chart given the history we actually have.
+
+    A zoom level longer than the stored data stays locked, so the line always
+    spans the chart left to right. While there is less than the smallest level
+    of data, the window is simply all the data. Returns a dict: hours, label,
+    unlocked (levels, ascending), next_lock ((hours, unlock epoch) or None)."""
+    first = tf.first_ts(db)
+    span = (now - first) / 3600 if first else 0.0
+    unlocked = [h for h, _ in TPS_ZOOM_LEVELS if h <= span]
+    if unlocked:
+        want = read_tps_zoom()
+        hours = max(h for h in unlocked if h <= want)
+        label = tps_zoom_label(hours)
+    else:  # less than the smallest level: show everything we have
+        hours = max(span, 1 / 60) + 1 / 3600  # pad 1s so the oldest sample is inside
+        label = f"{max(round(span * 60), 1)}m"
+    locked = [h for h, _ in TPS_ZOOM_LEVELS if h > span]
+    next_lock = (locked[0], first + locked[0] * 3600) if locked and first else None
+    return {"hours": hours, "label": label, "unlocked": unlocked, "next_lock": next_lock}
+
+
+def tps_title(view, now):
+    t = f"generation speed — tok/s ({view['label']}, via CPA)"
+    if len(view["unlocked"]) > 1:
+        t += " · click = zoom"
+    if view["next_lock"]:
+        h, epoch = view["next_lock"]
+        t += f" · {tps_zoom_label(h)} in {m.fmt_in(epoch, now)}"
+    return t
+
+
 def zoom_label(hours):
     return next((lbl for h, lbl in ZOOM_LEVELS if h == hours), f"{hours}h")
 
@@ -403,8 +435,9 @@ def token_speed_series(db, now, hours=DEFAULT_ZOOM):
     return [(by_provider[p], TOKEN_COLORS[p]) for p in TOKEN_IDS if p in by_provider]
 
 
-def render_charts(now, chart_dir, hours=DEFAULT_ZOOM):
-    """Render the charts to timestamped files; prune old; return the paths."""
+def render_charts(now, chart_dir, hours=DEFAULT_ZOOM, tdb=None, tps_hours=DEFAULT_TPS_ZOOM):
+    """Render the charts to timestamped files; prune old; return the paths.
+    tdb is the token-flow store (None = no data yet); tps_hours its window."""
     chart_dir.mkdir(parents=True, exist_ok=True)
     usage, speeds = chart_series(now, hours)
     ts = int(now)
@@ -413,11 +446,8 @@ def render_charts(now, chart_dir, hours=DEFAULT_ZOOM):
     tps_png = chart_dir / f"tps-{ts}.png"
     draw_multi_chart(usage, total_png, 610, 120, unit="%", ymin=0)
     draw_multi_chart(speeds, speed_png, 610, 90, unit="%/h")
-    db = tf.connect(readonly=True)
-    draw_multi_chart(token_speed_series(db, now, read_tps_zoom()), tps_png, 610, 90,
+    draw_multi_chart(token_speed_series(tdb, now, tps_hours), tps_png, 610, 90,
                      unit="t/s", ymin=0, dots=True)
-    if db:
-        db.close()
     for prefix in ("total-", "speed-", "tps-"):
         olds = sorted(chart_dir.glob(prefix + "*.png"),
                       key=lambda p: p.stat().st_mtime, reverse=True)
@@ -454,15 +484,17 @@ def panel_payload(now):
         pts = provider_series(samples, hourly, p, now, hours)
         sp = speed_from_pts(pts) if len(pts) >= 2 else []
         out[f"{p}_speed"] = f"{sp[-1]:+.1f}%/h" if sp else ""
-    total_png, speed_png, tps_png = render_charts(now, CACHE / "graphs", hours)
+    tdb = tf.connect(readonly=True)
+    view = tps_view(tdb, now)
+    total_png, speed_png, tps_png = render_charts(now, CACHE / "graphs", hours,
+                                                  tdb, view["hours"])
     out["img_total"] = str(total_png)
     out["img_speed"] = str(speed_png)
     out["img_tps"] = str(tps_png)
-    out["tps_range"] = tps_zoom_label(read_tps_zoom())
-    db = tf.connect(readonly=True)
-    tps = current_tps(db, now)
-    if db:
-        db.close()
+    out["tps_title"] = tps_title(view, now)
+    tps = current_tps(tdb, now)
+    if tdb:
+        tdb.close()
     for p in TOKEN_IDS:
         out[f"{p}_tps"] = f"{TOKEN_LABELS[p]} {tps[p]:.0f}t/s" if p in tps else ""
     out["clock"] = time.strftime("%H:%M:%S")
@@ -532,7 +564,7 @@ def render_yuck(initial_json="{}"):
     (box :orientation "h" :halign "end" :space-evenly false :class "legend" {SPEED_ROW})
     (button :class "gtitle" :onclick "{BRIDGE} --cycle-tps-zoom"
       (label :halign "start" :class "gtitle"
-        :text "generation speed — tok/s per provider (${{panel_data.tps_range}}, via CPA) · click = zoom"))
+        :text {{panel_data.tps_title}}))
     (box :class "graph" (image :path {{panel_data.img_tps}} :image-width 610 :image-height 90))
     (box :orientation "h" :halign "end" :space-evenly false :class "legend" {TPS_ROW})))))
 """
@@ -555,8 +587,15 @@ def main():
         print(f"zoom: {zoom_label(cur)} -> {zoom_label(nxt)}")
         return
     if "--cycle-tps-zoom" in argv:
-        levels = [h for h, _ in TPS_ZOOM_LEVELS]
-        cur = read_tps_zoom()
+        tdb = tf.connect(readonly=True)
+        view = tps_view(tdb, time.time())
+        if tdb:
+            tdb.close()
+        levels = view["unlocked"]
+        if len(levels) < 2:
+            print(f"tps zoom: only {view['label']} of data so far — nothing to cycle")
+            return
+        cur = max(h for h in levels if h <= read_tps_zoom())
         nxt = levels[(levels.index(cur) + 1) % len(levels)]
         TPS_ZOOM_FILE.parent.mkdir(parents=True, exist_ok=True)
         TPS_ZOOM_FILE.write_text(str(nxt))

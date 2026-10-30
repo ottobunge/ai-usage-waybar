@@ -108,6 +108,14 @@ def store(db, records):
 
 # --- aggregation --------------------------------------------------------------
 
+def first_ts(db):
+    """Timestamp of the oldest stored record, or None when the store is empty."""
+    if db is None:
+        return None
+    row = db.execute("SELECT MIN(ts) FROM requests").fetchone()
+    return row[0] if row else None
+
+
 def rate_series(db, hours, now, buckets=60):
     """{provider: [tokens/min per bucket]} (zero-filled), oldest first."""
     if db is None:
@@ -269,6 +277,7 @@ def selftest():
     assert abs(s["tps"] - 115 / 1.503) < 0.5, s  # only e1 qualifies for speed
     assert speed_series(db, 1, now, buckets=4)["zai"] == [None, None, None, 76.5]
     assert sum(rate_series(db, 1, now, buckets=4)["zai"]) > 0
+    assert first_ts(db) == row[1] and first_ts(None) is None
     assert fmt_tokens(1234) == "1.2k" and fmt_tokens(5_600_000) == "5.6M"
     print("tokenflow selftest ok")
 
