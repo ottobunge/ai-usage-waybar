@@ -218,6 +218,18 @@ def split_at_resets(pts):
     return segs
 
 
+def align_pts(pts, now, hours, slots=160):
+    """[(ts, v)] -> `slots` values on a shared time axis ending at `now`
+    (None where no sample landed), so every line is placed by time."""
+    out = [None] * slots
+    start, span = now - hours * 3600, hours * 3600
+    for ts, v in pts:
+        i = int((ts - start) / span * slots)
+        if 0 <= i < slots:
+            out[min(i, slots - 1)] = v
+    return out
+
+
 def speed_from_pts(pts, max_points=160):
     """/h derivative of a [(ts, value)] series. The series is downsampled to
     ~max_points first so intervals are minutes-wide (45 s raw sampling would
@@ -298,12 +310,14 @@ def write_png(path, w, h, rgb_rows):
 
 
 def draw_multi_chart(series, out_path, w, h, fill=False, unit="%",
-                     ymin=None, ymax=None, dots=False, max_gap=None):
+                     ymin=None, ymax=None, dots=False, max_gap=None, break_on_drop=False):
     """series: list of (values, rgb). Draws 0/mid/max gridlines labelled with
     the unit using the tiny font. A value may be None (no sample in that slot):
     the line skips it, and with dots=True every real sample gets a marker so a
     lone sample is still visible. max_gap: samples more than this many slots
-    apart are not joined by a line (no implied trend across missing data)."""
+    apart are not joined by a line (no implied trend across missing data).
+    break_on_drop: a falling value (usage reset) starts a fresh line instead of
+    drawing a cliff."""
     pad_l, pad_r, pad_t, pad_b = 48, 4, 8, 6
     all_vals = [v for vals, _ in series for v in vals if v is not None] or [0, 0]
     lo = ymin if ymin is not None else min(all_vals)
@@ -321,7 +335,7 @@ def draw_multi_chart(series, out_path, w, h, fill=False, unit="%",
     def to_pts(vals):
         n = max(len(vals), 2)
         return [(pad_l + round(i * (w - pad_l - pad_r - 1) / (n - 1)),
-                 pad_t + round((h - pad_t - pad_b) * (1 - (v - lo) / (hi - lo))), i)
+                 pad_t + round((h - pad_t - pad_b) * (1 - (v - lo) / (hi - lo))), i, v)
                 for i, v in enumerate(vals) if v is not None]
 
     for vals, rgb in series:
@@ -329,21 +343,23 @@ def draw_multi_chart(series, out_path, w, h, fill=False, unit="%",
             vals = (vals or [0]) + [0]
         pts = to_pts(vals)
         if dots:
-            for x, y, _ in pts:
+            for x, y, _, _ in pts:
                 for dy in range(-2, 3):
                     for dx in range(-2, 3):
                         if 0 <= y + dy < h and 0 <= x + dx < w:
                             rows[y + dy][x + dx] = rgb
         if fill and len(series) == 1:  # area fill only for single-series charts
-            for i, (x, y, _) in enumerate(pts):
+            for i, (x, y, _, _) in enumerate(pts):
                 x2 = pts[i + 1][0] if i + 1 < len(pts) else w - pad_r - 1
                 for xx in range(x, min(x2 + 1, w)):
                     for yy in range(y, h - pad_b):
                         rows[yy][xx] = (rgb[0] // 6 + 18, rgb[1] // 6 + 18, rgb[2] // 6 + 22)
         for i in range(len(pts) - 1):
-            (x0, y0, i0), (x1, y1, i1) = pts[i], pts[i + 1]
+            (x0, y0, i0, v0), (x1, y1, i1, v1) = pts[i], pts[i + 1]
             if max_gap is not None and i1 - i0 > max_gap:
                 continue  # too far apart to claim a trend: leave the dots alone
+            if break_on_drop and v1 < v0:
+                continue  # usage reset: don't draw a cliff
             steps = max(abs(x1 - x0), abs(y1 - y0), 1)
             for s in range(steps + 1):
                 xx = round(x0 + (x1 - x0) * s / steps)
@@ -419,13 +435,13 @@ def chart_series(now, hours=DEFAULT_ZOOM):
     for p in PANEL_IDS:
         pts = provider_series(samples, hourly, p, now, hours)
         if len(pts) >= 2:
-            for seg in split_at_resets(pts):  # one line per post-reset segment
-                usage.append(([v for _, v in seg], PROVIDER_COLORS[p]))
+            usage.append((align_pts(pts, now, hours), PROVIDER_COLORS[p]))
             sp = speed_from_pts(pts)
             if len(sp) >= 2:
                 speeds.append((sp, PROVIDER_COLORS[p]))
-    for seg in split_at_resets(total_pts):  # summed total, reset-aware
-        usage.append(([round(v, 1) for _, v in seg], (235, 235, 245)))
+    if total_pts:
+        usage.append((align_pts([(t, round(v, 1)) for t, v in total_pts], now, hours),
+                      (235, 235, 245)))
     if speeds:
         speeds.append((speed_from_pts(total_pts), (166, 227, 161)))
     return usage, speeds
@@ -447,7 +463,7 @@ def render_charts(now, chart_dir, hours=DEFAULT_ZOOM, tdb=None, tps_hours=DEFAUL
     total_png = chart_dir / f"total-{ts}.png"
     speed_png = chart_dir / f"speed-{ts}.png"
     tps_png = chart_dir / f"tps-{ts}.png"
-    draw_multi_chart(usage, total_png, 610, 120, unit="%", ymin=0)
+    draw_multi_chart(usage, total_png, 610, 120, unit="%", ymin=0, break_on_drop=True)
     draw_multi_chart(speeds, speed_png, 610, 90, unit="%/h")
     draw_multi_chart(token_speed_series(tdb, now, tps_hours), tps_png, 610, 90,
                      unit="t/s", ymin=0, dots=True, max_gap=4)
