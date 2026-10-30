@@ -125,8 +125,9 @@ def rate_series(db, hours, now, buckets=60):
 
 
 def speed_series(db, hours, now, buckets=60):
-    """{provider: [tok/s per bucket that had streamed traffic]}, oldest first.
-    Each point is total tokens / total generation seconds in the bucket."""
+    """{provider: [tok/s per bucket, None where no streamed traffic]}, oldest
+    first and time-aligned with rate_series. Each point is total tokens / total
+    generation seconds in the bucket."""
     if db is None:
         return {}
     span = hours * 3600
@@ -138,7 +139,8 @@ def speed_series(db, hours, now, buckets=60):
             f"FROM requests WHERE ts >= ? AND ts <= ? AND {SPEED_WHERE} "
             "GROUP BY 1, 2 ORDER BY 2", (start, width, start, now)):
         if ms:
-            out.setdefault(pid, []).append(round(tok / (ms / 1000), 1))
+            if 0 <= b < buckets:
+                out.setdefault(pid, [None] * buckets)[b] = round(tok / (ms / 1000), 1)
     return out
 
 
@@ -265,7 +267,7 @@ def selftest():
     s = provider_stats(db, now)["zai"]
     assert s["requests"] == 3 and s["out_tok"] == 115 * 2 + 3, s
     assert abs(s["tps"] - 115 / 1.503) < 0.5, s  # only e1 qualifies for speed
-    assert speed_series(db, 1, now, buckets=4)["zai"] == [76.5]
+    assert speed_series(db, 1, now, buckets=4)["zai"] == [None, None, None, 76.5]
     assert sum(rate_series(db, 1, now, buckets=4)["zai"]) > 0
     assert fmt_tokens(1234) == "1.2k" and fmt_tokens(5_600_000) == "5.6M"
     print("tokenflow selftest ok")

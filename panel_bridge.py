@@ -298,11 +298,13 @@ def write_png(path, w, h, rgb_rows):
 
 
 def draw_multi_chart(series, out_path, w, h, fill=False, unit="%",
-                     ymin=None, ymax=None):
+                     ymin=None, ymax=None, dots=False):
     """series: list of (values, rgb). Draws 0/mid/max gridlines labelled with
-    the unit using the tiny font."""
+    the unit using the tiny font. A value may be None (no sample in that slot):
+    the line skips it, and with dots=True every real sample gets a marker so a
+    lone sample is still visible."""
     pad_l, pad_r, pad_t, pad_b = 48, 4, 8, 6
-    all_vals = [v for vals, _ in series for v in vals] or [0, 0]
+    all_vals = [v for vals, _ in series for v in vals if v is not None] or [0, 0]
     lo = ymin if ymin is not None else min(all_vals)
     hi = ymax if ymax is not None else max(all_vals)
     if hi - lo < 1e-9:
@@ -319,12 +321,18 @@ def draw_multi_chart(series, out_path, w, h, fill=False, unit="%",
         n = max(len(vals), 2)
         return [(pad_l + round(i * (w - pad_l - pad_r - 1) / (n - 1)),
                  pad_t + round((h - pad_t - pad_b) * (1 - (v - lo) / (hi - lo))))
-                for i, v in enumerate(vals)]
+                for i, v in enumerate(vals) if v is not None]
 
     for vals, rgb in series:
         if len(vals) < 2:
             vals = (vals or [0]) + [0]
         pts = to_pts(vals)
+        if dots:
+            for x, y in pts:
+                for dy in range(-2, 3):
+                    for dx in range(-2, 3):
+                        if 0 <= y + dy < h and 0 <= x + dx < w:
+                            rows[y + dy][x + dx] = rgb
         if fill and len(series) == 1:  # area fill only for single-series charts
             for i, (x, y) in enumerate(pts):
                 x2 = pts[i + 1][0] if i + 1 < len(pts) else w - pad_r - 1
@@ -389,10 +397,10 @@ def chart_series(now, hours=DEFAULT_ZOOM):
 
 
 def token_speed_series(db, now, hours=DEFAULT_ZOOM):
-    """[(tok/s values, rgb)] per provider with >= 2 buckets of streamed traffic."""
+    """[(time-aligned tok/s values with None gaps, rgb)] for every provider that
+    has at least one streamed sample in the window."""
     by_provider = tf.speed_series(db, hours, now)
-    return [(by_provider[p], TOKEN_COLORS[p]) for p in TOKEN_IDS
-            if len(by_provider.get(p, [])) >= 2]
+    return [(by_provider[p], TOKEN_COLORS[p]) for p in TOKEN_IDS if p in by_provider]
 
 
 def render_charts(now, chart_dir, hours=DEFAULT_ZOOM):
@@ -407,7 +415,7 @@ def render_charts(now, chart_dir, hours=DEFAULT_ZOOM):
     draw_multi_chart(speeds, speed_png, 610, 90, unit="%/h")
     db = tf.connect(readonly=True)
     draw_multi_chart(token_speed_series(db, now, read_tps_zoom()), tps_png, 610, 90,
-                     unit="t/s", ymin=0)
+                     unit="t/s", ymin=0, dots=True)
     if db:
         db.close()
     for prefix in ("total-", "speed-", "tps-"):
@@ -456,7 +464,7 @@ def panel_payload(now):
     if db:
         db.close()
     for p in TOKEN_IDS:
-        out[f"{p}_tps"] = f"{tps[p]:.0f}t/s" if p in tps else ""
+        out[f"{p}_tps"] = f"{TOKEN_LABELS[p]} {tps[p]:.0f}t/s" if p in tps else ""
     out["clock"] = time.strftime("%H:%M:%S")
     return out
 
