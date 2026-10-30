@@ -134,21 +134,22 @@ def rate_series(db, hours, now, buckets=60):
 
 def speed_series(db, hours, now, buckets=60):
     """{provider: [tok/s per bucket, None where no streamed traffic]}, oldest
-    first and time-aligned with rate_series. Each point is total tokens / total
+    first. Buckets sit on absolute wall-clock boundaries (not on `now`), so a
+    finished bucket never changes value as the window slides; the window ends
+    with the bucket containing `now`. Each point is total tokens / total
     generation seconds in the bucket."""
     if db is None:
         return {}
-    span = hours * 3600
-    width = span / buckets
-    start = now - span
+    width = hours * 3600 / buckets
+    last = int(now // width)
+    first = last - buckets + 1
     out = {}
     for pid, b, tok, ms in db.execute(
-            f"SELECT provider, CAST((ts - ?) / ? AS INT), SUM(output), SUM({GEN_MS}) "
+            f"SELECT provider, CAST(ts / ? AS INT), SUM(output), SUM({GEN_MS}) "
             f"FROM requests WHERE ts >= ? AND ts <= ? AND {SPEED_WHERE} "
-            "GROUP BY 1, 2 ORDER BY 2", (start, width, start, now)):
-        if ms:
-            if 0 <= b < buckets:
-                out.setdefault(pid, [None] * buckets)[b] = round(tok / (ms / 1000), 1)
+            "GROUP BY 1, 2 ORDER BY 2", (width, first * width, now)):
+        if ms and first <= b <= last:
+            out.setdefault(pid, [None] * buckets)[b - first] = round(tok / (ms / 1000), 1)
     return out
 
 
@@ -275,7 +276,8 @@ def selftest():
     s = provider_stats(db, now)["zai"]
     assert s["requests"] == 3 and s["out_tok"] == 115 * 2 + 3, s
     assert abs(s["tps"] - 115 / 1.503) < 0.5, s  # only e1 qualifies for speed
-    assert speed_series(db, 1, now, buckets=4)["zai"] == [None, None, None, 76.5]
+    sp = speed_series(db, 1, now, buckets=4)["zai"]
+    assert len(sp) == 4 and [v for v in sp if v is not None] == [76.5], sp
     assert sum(rate_series(db, 1, now, buckets=4)["zai"]) > 0
     assert first_ts(db) == row[1] and first_ts(None) is None
     assert fmt_tokens(1234) == "1.2k" and fmt_tokens(5_600_000) == "5.6M"

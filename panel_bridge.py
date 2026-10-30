@@ -17,6 +17,7 @@ Usage:
 """
 import json
 import sys
+import math
 import time
 from pathlib import Path
 
@@ -218,16 +219,57 @@ def split_at_resets(pts):
     return segs
 
 
-def align_pts(pts, now, hours, slots=160):
-    """[(ts, v)] -> `slots` values on a shared time axis ending at `now`
-    (None where no sample landed), so every line is placed by time."""
-    out = [None] * slots
-    start, span = now - hours * 3600, hours * 3600
-    for ts, v in pts:
-        i = int((ts - start) / span * slots)
-        if 0 <= i < slots:
-            out[min(i, slots - 1)] = v
+def resample(pts, now, hours, slots=160, max_span=2 * 3600):
+    """[(ts, v)] -> `slots` values on a time grid ending at `now`. Interior
+    slots are linearly interpolated between neighbouring samples so a sparse
+    (hourly) stretch stays one continuous line; a stretch with no sample for
+    more than `max_span` seconds is a real gap (None); a usage reset (value
+    drop) holds the old value and then falls in one step. The grid sits on
+    absolute wall-clock boundaries so existing points don't shift between
+    refreshes; only the final slot (= now) moves."""
+    import bisect
+    step = hours * 3600 / slots
+    times = [(int(now // step) - (slots - 1) + i) * step for i in range(slots)]
+    times[-1] = now
+    ts_list = [t for t, _ in pts]
+    out = []
+    for t in times:
+        i = bisect.bisect_right(ts_list, t)
+        if i == 0:
+            out.append(None)
+            continue
+        t0, v0 = pts[i - 1]
+        if i == len(pts):
+            out.append(v0 if t - t0 <= max_span else None)
+            continue
+        t1, v1 = pts[i]
+        if t1 - t0 > max_span:
+            out.append(None)
+        elif v1 < v0:
+            out.append(v0)
+        else:
+            out.append(v0 + (v1 - v0) * (t - t0) / (t1 - t0))
     return out
+
+
+def smooth(vals, radius=2):
+    """Moving average that ignores None and keeps None where the input is None."""
+    out = []
+    for i, v in enumerate(vals):
+        if v is None:
+            out.append(None)
+            continue
+        win = [x for x in vals[max(0, i - radius):i + radius + 1] if x is not None]
+        out.append(sum(win) / len(win))
+    return out
+
+
+def rate_from_slots(vals, step_h, radius=2):
+    """/h derivative of a resampled series; resets and gaps count as no change."""
+    rate = [None]
+    for a, b in zip(vals, vals[1:]):
+        rate.append(None if a is None or b is None else max(b - a, 0) / step_h)
+    return smooth(rate, radius)
 
 
 def speed_from_pts(pts, max_points=160):
@@ -309,16 +351,42 @@ def write_png(path, w, h, rgb_rows):
     Path(path).write_bytes(png)
 
 
-def draw_multi_chart(series, out_path, w, h, fill=False, unit="%",
-                     ymin=None, ymax=None, dots=False, max_gap=None, break_on_drop=False):
-    """series: list of (values, rgb). Draws 0/mid/max gridlines labelled with
-    the unit using the tiny font. A value may be None (no sample in that slot):
-    the line skips it, and with dots=True every real sample gets a marker so a
-    lone sample is still visible. max_gap: samples more than this many slots
-    apart are not joined by a line (no implied trend across missing data).
-    break_on_drop: a falling value (usage reset) starts a fresh line instead of
-    drawing a cliff."""
-    pad_l, pad_r, pad_t, pad_b = 48, 4, 8, 6
+def _blend(rows, x, y, rgb, a):
+    if a <= 0 or not (0 <= y < len(rows) and 0 <= x < len(rows[0])):
+        return
+    r0 = rows[y][x]
+    rows[y][x] = (int(r0[0] + (rgb[0] - r0[0]) * a), int(r0[1] + (rgb[1] - r0[1]) * a),
+                  int(r0[2] + (rgb[2] - r0[2]) * a))
+
+
+def aa_line(rows, x0, y0, x1, y1, rgb, width=2.0, alpha=1.0):
+    """Anti-aliased line segment (coverage from distance to the segment)."""
+    half = width / 2 + 0.5
+    dx, dy = x1 - x0, y1 - y0
+    len2 = dx * dx + dy * dy or 1.0
+    for py in range(int(min(y0, y1) - half), int(max(y0, y1) + half) + 1):
+        for px in range(int(min(x0, x1) - half), int(max(x0, x1) + half) + 1):
+            t = max(0.0, min(1.0, ((px + 0.5 - x0) * dx + (py + 0.5 - y0) * dy) / len2))
+            d = math.hypot(px + 0.5 - (x0 + t * dx), py + 0.5 - (y0 + t * dy))
+            _blend(rows, px, py, rgb, min(1.0, half - d) * alpha)
+
+
+def aa_dot(rows, cx, cy, rgb, r=2.4):
+    for py in range(int(cy - r - 1), int(cy + r + 2)):
+        for px in range(int(cx - r - 1), int(cx + r + 2)):
+            d = math.hypot(px + 0.5 - cx, py + 0.5 - cy)
+            _blend(rows, px, py, rgb, min(1.0, r + 0.5 - d))
+
+
+def draw_multi_chart(series, out_path, w, h, unit="%", ymin=None, ymax=None,
+                     dots=False, max_gap=None, dim_gap=None, drop_alpha=None):
+    """series: list of (values, rgb); values are on a shared time grid, None =
+    no sample in that slot. Lines are anti-aliased. max_gap: samples more than
+    this many slots apart are not joined; dim_gap: joins spanning more than
+    this many slots (data was missing in between) are drawn faint; drop_alpha:
+    a falling segment (usage reset) is drawn at this opacity. dots=True marks
+    every real sample so a lone one is still visible."""
+    pad_l, pad_r, pad_t, pad_b = 48, 6, 10, 6
     all_vals = [v for vals, _ in series for v in vals if v is not None] or [0, 0]
     lo = ymin if ymin is not None else min(all_vals)
     hi = ymax if ymax is not None else max(all_vals)
@@ -327,46 +395,32 @@ def draw_multi_chart(series, out_path, w, h, fill=False, unit="%",
     rows = [[(30, 32, 46)] * w for _ in range(h)]
     for frac in (0.0, 0.5, 1.0):
         y = pad_t + round((h - pad_t - pad_b) * (1 - frac))
-        for xx in range(pad_l, w - pad_r):
+        for xx in range(pad_l, w - pad_r, 1 if frac == 0.0 else 3):  # dashed, base solid
             rows[y][xx] = (49, 50, 68)
         val = lo + (hi - lo) * frac
         draw_text(rows, 2, y - 5, f"{val:.0f}{unit}", (166, 173, 200), scale=2)
 
     def to_pts(vals):
         n = max(len(vals), 2)
-        return [(pad_l + round(i * (w - pad_l - pad_r - 1) / (n - 1)),
-                 pad_t + round((h - pad_t - pad_b) * (1 - (v - lo) / (hi - lo))), i, v)
+        return [(pad_l + i * (w - pad_l - pad_r - 1) / (n - 1),
+                 pad_t + (h - pad_t - pad_b) * (1 - (v - lo) / (hi - lo)), i, v)
                 for i, v in enumerate(vals) if v is not None]
 
     for vals, rgb in series:
-        if len(vals) < 2:
-            vals = (vals or [0]) + [0]
         pts = to_pts(vals)
-        if dots:
-            for x, y, _, _ in pts:
-                for dy in range(-2, 3):
-                    for dx in range(-2, 3):
-                        if 0 <= y + dy < h and 0 <= x + dx < w:
-                            rows[y + dy][x + dx] = rgb
-        if fill and len(series) == 1:  # area fill only for single-series charts
-            for i, (x, y, _, _) in enumerate(pts):
-                x2 = pts[i + 1][0] if i + 1 < len(pts) else w - pad_r - 1
-                for xx in range(x, min(x2 + 1, w)):
-                    for yy in range(y, h - pad_b):
-                        rows[yy][xx] = (rgb[0] // 6 + 18, rgb[1] // 6 + 18, rgb[2] // 6 + 22)
         for i in range(len(pts) - 1):
             (x0, y0, i0, v0), (x1, y1, i1, v1) = pts[i], pts[i + 1]
             if max_gap is not None and i1 - i0 > max_gap:
                 continue  # too far apart to claim a trend: leave the dots alone
-            if break_on_drop and v1 < v0:
-                continue  # usage reset: don't draw a cliff
-            steps = max(abs(x1 - x0), abs(y1 - y0), 1)
-            for s in range(steps + 1):
-                xx = round(x0 + (x1 - x0) * s / steps)
-                yy = round(y0 + (y1 - y0) * s / steps)
-                for dy in (-1, 0, 1):
-                    if 0 <= yy + dy < h:
-                        rows[yy + dy][xx] = rgb
+            alpha = 1.0
+            if dim_gap is not None and i1 - i0 > dim_gap:
+                alpha = 0.4
+            if drop_alpha is not None and v1 < v0:
+                alpha = drop_alpha
+            aa_line(rows, x0, y0, x1, y1, rgb, 2.0, alpha)
+        if dots or len(pts) == 1:
+            for x, y, _, _ in pts:
+                aa_dot(rows, x, y, rgb)
     write_png(out_path, w, h, rows)
 
 
@@ -426,24 +480,23 @@ def zoom_label(hours):
     return next((lbl for h, lbl in ZOOM_LEVELS if h == hours), f"{hours}h")
 
 
-def chart_series(now, hours=DEFAULT_ZOOM):
+def chart_series(now, hours=DEFAULT_ZOOM, slots=160):
     state = load_json(CACHE / "state.json") or {}
     samples = state.get("usage_samples") or []
     hourly = state.get("usage_samples_hourly")
+    step_h = hours / slots
     total_pts, _ = build_series(samples, hourly, now, hours)
     usage, speeds = [], []
     for p in PANEL_IDS:
         pts = provider_series(samples, hourly, p, now, hours)
         if len(pts) >= 2:
-            usage.append((align_pts(pts, now, hours), PROVIDER_COLORS[p]))
-            sp = speed_from_pts(pts)
-            if len(sp) >= 2:
-                speeds.append((sp, PROVIDER_COLORS[p]))
+            vals = resample(pts, now, hours, slots)
+            usage.append((vals, PROVIDER_COLORS[p]))
+            speeds.append((rate_from_slots(vals, step_h), PROVIDER_COLORS[p]))
     if total_pts:
-        usage.append((align_pts([(t, round(v, 1)) for t, v in total_pts], now, hours),
-                      (235, 235, 245)))
-    if speeds:
-        speeds.append((speed_from_pts(total_pts), (166, 227, 161)))
+        vals = resample(total_pts, now, hours, slots)
+        usage.append((vals, (235, 235, 245)))
+        speeds.append((rate_from_slots(vals, step_h), (235, 235, 245)))
     return usage, speeds
 
 
@@ -451,7 +504,24 @@ def token_speed_series(db, now, hours=DEFAULT_ZOOM):
     """[(time-aligned tok/s values with None gaps, rgb)] for every provider that
     has at least one streamed sample in the window."""
     by_provider = tf.speed_series(db, hours, now)
-    return [(by_provider[p], TOKEN_COLORS[p]) for p in TOKEN_IDS if p in by_provider]
+    return [(smooth_present(by_provider[p]), TOKEN_COLORS[p])
+            for p in TOKEN_IDS if p in by_provider]
+
+
+def smooth_present(vals):
+    """3-point [1,2,1] smoothing over adjacent real samples only, so isolated
+    bursts keep their value while neighbouring ones stop jittering."""
+    out = []
+    for i, v in enumerate(vals):
+        if v is None:
+            out.append(None)
+            continue
+        num, den = 2 * v, 2
+        for j in (i - 1, i + 1):
+            if 0 <= j < len(vals) and vals[j] is not None:
+                num, den = num + vals[j], den + 1
+        out.append(round(num / den, 1))
+    return out
 
 
 def render_charts(now, chart_dir, hours=DEFAULT_ZOOM, tdb=None, tps_hours=DEFAULT_TPS_ZOOM):
@@ -463,10 +533,11 @@ def render_charts(now, chart_dir, hours=DEFAULT_ZOOM, tdb=None, tps_hours=DEFAUL
     total_png = chart_dir / f"total-{ts}.png"
     speed_png = chart_dir / f"speed-{ts}.png"
     tps_png = chart_dir / f"tps-{ts}.png"
-    draw_multi_chart(usage, total_png, 610, 120, unit="%", ymin=0, break_on_drop=True)
-    draw_multi_chart(speeds, speed_png, 610, 90, unit="%/h")
+    draw_multi_chart(usage, total_png, 610, 120, unit="%", ymin=0, drop_alpha=0.3)
+    draw_multi_chart(speeds, speed_png, 610, 90, unit="%/h", ymin=0)
+    # idle stretches are bridged by a faint line (up to a quarter of the window)
     draw_multi_chart(token_speed_series(tdb, now, tps_hours), tps_png, 610, 90,
-                     unit="t/s", ymin=0, dots=True, max_gap=4)
+                     unit="t/s", ymin=0, dots=True, max_gap=15, dim_gap=1)
     for prefix in ("total-", "speed-", "tps-"):
         olds = sorted(chart_dir.glob(prefix + "*.png"),
                       key=lambda p: p.stat().st_mtime, reverse=True)
