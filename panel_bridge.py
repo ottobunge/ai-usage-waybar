@@ -471,7 +471,7 @@ def tps_view(db, now):
 
 
 def tps_title(view, now):
-    t = f"generation speed — tok/s ({view['label']}, latest (max))"
+    t = f"generation speed — tok/s ({view['label']}, now (max))"
     if len(view["unlocked"]) > 1:
         t += " · click = zoom"
     if view["next_lock"]:
@@ -558,13 +558,15 @@ def render_charts(now, chart_dir, hours=DEFAULT_ZOOM, tdb=None, tps_hours=DEFAUL
 
 
 def tps_legend(db, now, hours):
-    """{provider: (latest tok/s, max tok/s)} over the chart window, from the
-    same buckets the chart draws, so the legend always matches the lines."""
+    """{provider: (current tok/s, max tok/s)} over the chart window, from the
+    same buckets the chart draws, so the legend matches the lines. Current is
+    the newest of the last two buckets, 0 when the provider is idle now."""
     out = {}
     for p, vals in tf.speed_series(db, hours, now).items():
         real = [v for v in vals if v is not None]
         if p in TOKEN_IDS and real:
-            out[p] = (real[-1], max(real))
+            recent = [v for v in vals[-2:] if v is not None]
+            out[p] = (recent[-1] if recent else 0, max(real))
     return out
 
 
