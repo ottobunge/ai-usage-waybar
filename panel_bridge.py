@@ -381,13 +381,14 @@ def aa_dot(rows, cx, cy, rgb, r=2.4):
 def draw_multi_chart(series, out_path, w, h, unit="%", ymin=None, ymax=None,
                      dots=False, max_gap=None, dim_gap=None, drop_alpha=None):
     """series: list of (values, rgb); values are on a shared time grid, None =
-    no sample in that slot. Lines are anti-aliased. max_gap: samples more than
+    no sample in that slot; an optional third element is the set of indices that
+    get a dot when dots=True. Lines are anti-aliased. max_gap: samples more than
     this many slots apart are not joined; dim_gap: joins spanning more than
     this many slots (data was missing in between) are drawn faint; drop_alpha:
     a falling segment (usage reset) is drawn at this opacity. dots=True marks
     every real sample so a lone one is still visible."""
     pad_l, pad_r, pad_t, pad_b = 48, 6, 10, 6
-    all_vals = [v for vals, _ in series for v in vals if v is not None] or [0, 0]
+    all_vals = [v for item in series for v in item[0] if v is not None] or [0, 0]
     lo = ymin if ymin is not None else min(all_vals)
     hi = ymax if ymax is not None else max(all_vals)
     if hi - lo < 1e-9:
@@ -406,7 +407,9 @@ def draw_multi_chart(series, out_path, w, h, unit="%", ymin=None, ymax=None,
                  pad_t + (h - pad_t - pad_b) * (1 - (v - lo) / (hi - lo)), i, v)
                 for i, v in enumerate(vals) if v is not None]
 
-    for vals, rgb in series:
+    for item in series:
+        vals, rgb = item[0], item[1]
+        marks = item[2] if len(item) > 2 else None  # indices that get a dot
         pts = to_pts(vals)
         for i in range(len(pts) - 1):
             (x0, y0, i0, v0), (x1, y1, i1, v1) = pts[i], pts[i + 1]
@@ -419,8 +422,9 @@ def draw_multi_chart(series, out_path, w, h, unit="%", ymin=None, ymax=None,
                 alpha = drop_alpha
             aa_line(rows, x0, y0, x1, y1, rgb, 2.0, alpha)
         if dots or len(pts) == 1:
-            for x, y, _, _ in pts:
-                aa_dot(rows, x, y, rgb)
+            for x, y, i, _ in pts:
+                if marks is None or i in marks:
+                    aa_dot(rows, x, y, rgb)
     write_png(out_path, w, h, rows)
 
 
@@ -501,11 +505,19 @@ def chart_series(now, hours=DEFAULT_ZOOM, slots=160):
 
 
 def token_speed_series(db, now, hours=DEFAULT_ZOOM):
-    """[(time-aligned tok/s values with None gaps, rgb)] for every provider that
-    has at least one streamed sample in the window."""
+    """[(tok/s per slot with idle slots at 0, rgb, real-sample indices)] for every
+    provider that has at least one streamed sample in the window."""
     by_provider = tf.speed_series(db, hours, now)
-    return [(smooth_present(by_provider[p]), TOKEN_COLORS[p])
-            for p in TOKEN_IDS if p in by_provider]
+    out = []
+    for p in TOKEN_IDS:
+        if p not in by_provider:
+            continue
+        raw = by_provider[p]
+        real = {i for i, v in enumerate(raw) if v is not None}
+        # no tokens flowing = 0 tok/s: the line drops to the baseline instead of
+        # leaving a hole; only the real samples get a dot
+        out.append(([v or 0 for v in smooth_present(raw)], TOKEN_COLORS[p], real))
+    return out
 
 
 def smooth_present(vals):
@@ -535,9 +547,8 @@ def render_charts(now, chart_dir, hours=DEFAULT_ZOOM, tdb=None, tps_hours=DEFAUL
     tps_png = chart_dir / f"tps-{ts}.png"
     draw_multi_chart(usage, total_png, 610, 120, unit="%", ymin=0, drop_alpha=0.3)
     draw_multi_chart(speeds, speed_png, 610, 90, unit="%/h", ymin=0)
-    # idle stretches are bridged by a faint line (up to a quarter of the window)
     draw_multi_chart(token_speed_series(tdb, now, tps_hours), tps_png, 610, 90,
-                     unit="t/s", ymin=0, dots=True, max_gap=15, dim_gap=1)
+                     unit="t/s", ymin=0, dots=True)
     for prefix in ("total-", "speed-", "tps-"):
         olds = sorted(chart_dir.glob(prefix + "*.png"),
                       key=lambda p: p.stat().st_mtime, reverse=True)
