@@ -471,12 +471,9 @@ def tps_view(db, now):
 
 
 def tps_title(view, now):
-    t = f"generation speed — tok/s ({view['label']}, now (max))"
+    t = f"tok/s — {view['label']}"
     if len(view["unlocked"]) > 1:
         t += " · click = zoom"
-    if view["next_lock"]:
-        h, epoch = view["next_lock"]
-        t += f" · {tps_zoom_label(h)} in {m.fmt_in(epoch, now)}"
     return t
 
 
@@ -604,21 +601,30 @@ def panel_payload(now):
     return out
 
 
-LEGEND = " ".join(
-    f'(box :orientation "h" :space-evenly false '
-    f'(box :class "ldot" :style "background-color: #{r:02x}{g:02x}{b:02x};") '
-    f'(label :class "lname" :text "{PANEL_LABELS[p]}"))'
-    for p, (r, g, b) in PROVIDER_COLORS.items())
+def _chunked_legend(entries, per_row):
+    rows = [entries[i:i + per_row] for i in range(0, len(entries), per_row)]
+    rendered = []
+    for row in rows:
+        rendered.append(
+            '(box :orientation "h" :space-evenly false ' + " ".join(row) + ")")
+    return '(box :orientation "v" :space-evenly false ' + " ".join(rendered) + ")"
 
-TPS_ROW = " ".join(
-    f'(label :class "lname" :style "color: #{r:02x}{g:02x}{b:02x}; margin-left: 12px;" '
-    f':text {{panel_data.{p}_tps}})'
-    for p, (r, g, b) in TOKEN_COLORS.items())
 
-SPEED_ROW = " ".join(
-    f'(label :class "lname" :style "color: #{r:02x}{g:02x}{b:02x}; margin-left: 12px;" '
-    f':text {{panel_data.{p}_speed}})'
-    for p, (r, g, b) in PROVIDER_COLORS.items())
+LEGEND = _chunked_legend(
+    [f'(box :orientation "h" :space-evenly false '
+     f'(box :class "ldot" :style "background-color: #{r:02x}{g:02x}{b:02x};") '
+     f'(label :class "lname" :text "{PANEL_LABELS[p]}"))'
+     for p, (r, g, b) in PROVIDER_COLORS.items()], 3)
+
+TPS_ROW = _chunked_legend(
+    [f'(label :class "lname" :style "color: #{r:02x}{g:02x}{b:02x}; margin-left: 8px;" '
+     f':text {{panel_data.{p}_tps}})'
+     for p, (r, g, b) in TOKEN_COLORS.items()], 2)
+
+SPEED_ROW = _chunked_legend(
+    [f'(label :class "lname" :style "color: #{r:02x}{g:02x}{b:02x}; margin-left: 8px;" '
+     f':text {{panel_data.{p}_speed}})'
+     for p, (r, g, b) in PROVIDER_COLORS.items()], 2)
 
 
 def panel_geometry():
@@ -646,7 +652,7 @@ def render_yuck(initial_json="{}"):
     return f"""
 (defpoll panel_data :interval "2s" :initial "{initial_json}" `{BRIDGE} --emit panel_data`)
 (defwindow ai-panel :monitor {monitor} :stacking "fg"
-  :geometry (geometry :x "0px" :y "0px" :width "320px" :height "{height}px" :anchor "top right")
+  :geometry (geometry :x "0px" :y "0px" :width "305px" :height "{height}px" :anchor "top right")
   (box :orientation "v" :space-evenly false :class "root"
     (box :orientation "h" :space-evenly false :hexpand true
       (label :halign "start" :class "title" :text "AI usage")
@@ -657,12 +663,12 @@ def render_yuck(initial_json="{}"):
 """ + "\n".join(cards) + f"""
     (button :class "gtitle" :onclick "{BRIDGE} --cycle-zoom"
       (label :halign "start" :class "gtitle"
-        :text "usage — ${{panel_data.range}}, worst window per provider · click = zoom"))
+        :text "usage — ${{panel_data.range}} · click = zoom"))
     (box :orientation "h" :space-evenly false :class "legend" {LEGEND})
     (box :class "graph" (image :path {{panel_data.img_total}} :image-width 305 :image-height 120))
     (button :class "gtitle" :onclick "{BRIDGE} --cycle-zoom"
       (label :halign "start" :class "gtitle"
-        :text "speed — %/h per provider (${{panel_data.range}}) · click = zoom"))
+        :text "speed %/h — ${{panel_data.range}} · click = zoom"))
     (box :class "graph" (image :path {{panel_data.img_speed}} :image-width 305 :image-height 90))
     (box :orientation "h" :halign "end" :space-evenly false :class "legend" {SPEED_ROW})
     (button :class "gtitle" :onclick "{BRIDGE} --cycle-tps-zoom"
