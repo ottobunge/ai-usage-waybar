@@ -545,9 +545,9 @@ def render_charts(now, chart_dir, hours=DEFAULT_ZOOM, tdb=None, tps_hours=DEFAUL
     total_png = chart_dir / f"total-{ts}.png"
     speed_png = chart_dir / f"speed-{ts}.png"
     tps_png = chart_dir / f"tps-{ts}.png"
-    draw_multi_chart(usage, total_png, 610, 120, unit="%", ymin=0, drop_alpha=0.3)
-    draw_multi_chart(speeds, speed_png, 610, 90, unit="%/h", ymin=0)
-    draw_multi_chart(token_speed_series(tdb, now, tps_hours), tps_png, 610, 90,
+    draw_multi_chart(usage, total_png, 305, 120, unit="%", ymin=0, drop_alpha=0.3)
+    draw_multi_chart(speeds, speed_png, 305, 90, unit="%/h", ymin=0)
+    draw_multi_chart(token_speed_series(tdb, now, tps_hours), tps_png, 305, 90,
                      unit="t/s", ymin=0, dots=True)
     for prefix in ("total-", "speed-", "tps-"):
         olds = sorted(chart_dir.glob(prefix + "*.png"),
@@ -646,7 +646,7 @@ def render_yuck(initial_json="{}"):
     return f"""
 (defpoll panel_data :interval "2s" :initial "{initial_json}" `{BRIDGE} --emit panel_data`)
 (defwindow ai-panel :monitor {monitor} :stacking "fg"
-  :geometry (geometry :x "0px" :y "0px" :width "640px" :height "{height}px" :anchor "top right")
+  :geometry (geometry :x "0px" :y "0px" :width "320px" :height "{height}px" :anchor "top right")
   (box :orientation "v" :space-evenly false :class "root"
     (box :orientation "h" :space-evenly false :hexpand true
       (label :halign "start" :class "title" :text "AI usage")
@@ -659,16 +659,16 @@ def render_yuck(initial_json="{}"):
       (label :halign "start" :class "gtitle"
         :text "usage — ${{panel_data.range}}, worst window per provider · click = zoom"))
     (box :orientation "h" :space-evenly false :class "legend" {LEGEND})
-    (box :class "graph" (image :path {{panel_data.img_total}} :image-width 610 :image-height 120))
+    (box :class "graph" (image :path {{panel_data.img_total}} :image-width 305 :image-height 120))
     (button :class "gtitle" :onclick "{BRIDGE} --cycle-zoom"
       (label :halign "start" :class "gtitle"
         :text "speed — %/h per provider (${{panel_data.range}}) · click = zoom"))
-    (box :class "graph" (image :path {{panel_data.img_speed}} :image-width 610 :image-height 90))
+    (box :class "graph" (image :path {{panel_data.img_speed}} :image-width 305 :image-height 90))
     (box :orientation "h" :halign "end" :space-evenly false :class "legend" {SPEED_ROW})
     (button :class "gtitle" :onclick "{BRIDGE} --cycle-tps-zoom"
       (label :halign "start" :class "gtitle"
         :text {{panel_data.tps_title}}))
-    (box :class "graph" (image :path {{panel_data.img_tps}} :image-width 610 :image-height 90))
+    (box :class "graph" (image :path {{panel_data.img_tps}} :image-width 305 :image-height 90))
     (box :orientation "h" :halign "end" :space-evenly false :class "legend" {TPS_ROW})))))
 """
 
