@@ -38,11 +38,19 @@ CURSOR_DBS = [
 # Per-provider minimum seconds between live endpoint hits (cache enforces it).
 # Anthropic 429s aggressively — never lower it (skill: ai-plan-usage-tracking).
 MIN_INTERVALS = {"anthropic": 300, "codex": 120, "zai": 120, "kimi": 120,
-                 "minimax": 120, "deepseek": 600, "opencode": 60, "cursor": 600}
+                 "minimax": 120, "deepseek": 600, "opencode": 60, "cursor": 600,
+                 "cpa": 120}
 
 DEFAULTS = {
     "mode": "all",  # "all" or e.g. "single:codex"
     "providers": {},  # e.g. {"cursor": true} to enable experimental ones
+    # CPA gateways (CLIProxyAPI on heavengraph): when the management key is
+    # present the cpa provider replaces the direct-poll set — all auths
+    # (personal + work claude, codex, antigravity, kimi oauth) and every
+    # quota-key provider are read from the gateway's management API instead.
+    "cpa": {"enabled": True,
+            "base": "http://10.8.0.3:8317",        # personal gateway
+            "work_base": "http://10.8.0.3:8318"},  # work gateway (seed28)
     "carousel": {"enabled": True, "seconds": 5},  # rotate one provider per tick
     "notify": {"enabled": True, "quota_warn_pct": 80, "quota_crit_pct": 95,
                "money_warn_below": 10.0},
@@ -71,7 +79,20 @@ def load_config():
 
 
 def enabled(pid, cfg):
-    return bool(cfg["providers"].get(pid, pid != "cursor"))
+    if pid == "cpa":
+        return cpa_active(cfg)
+    if cpa_active(cfg):
+        # The CPA provider reports every auth this machine has keys for;
+        # direct upstream polling would duplicate it (double rate-limit).
+        default = False
+    else:
+        default = pid != "cursor"
+    return bool(cfg["providers"].get(pid, default))
+
+
+def cpa_active(cfg):
+    c = cfg.get("cpa") or {}
+    return bool(c.get("enabled", True)) and bool(os.environ.get("CLIPROXY_MGMT_KEY"))
 
 
 def http_json(url, headers, timeout=15):
@@ -108,14 +129,17 @@ def cache_put(name, data):
 
 def fetch_cached(name, fn):
     """Run provider fn, but serve cache when fresher than MIN_INTERVALS[name];
-    on failure fall back to stale cache rather than dropping the segment."""
+    on failure fall back to stale cache rather than dropping the segment.
+    A provider may return a dict (one item) or a list (fan-out items)."""
     cached = cache_get(name, MIN_INTERVALS[name])
     if cached is not None:
         return cached
     result = fn()
-    if not result.get("error"):
+    if isinstance(result, list) or not result.get("error"):
         cache_put(name, result)
     elif (stale := cache_get(name, 10 ** 9)) is not None:
+        if isinstance(stale, list):
+            return [dict(x, stale=True) for x in stale]
         stale = dict(stale)
         stale["stale"] = True
         return stale
@@ -516,14 +540,205 @@ def provider_cursor():
 
 # --- rendering & notifications ----------------------------------------------
 
-PROVIDERS = [("anthropic", "A"), ("codex", "X"), ("zai", "Z"), ("kimi", "K"),
-             ("minimax", "M"), ("deepseek", "D"), ("opencode", "O"), ("cursor", "U")]
+# --- CPA gateway auths (CLIProxyAPI management API) --------------------------
+#
+# One fetch covers every credential the fleet routes through: GET
+# /v0/management/auth-files on the personal and work gateways returns each
+# auth's account, availability, cooldowns and the quota signals CPA observed
+# on its responses; the quota-key providers are additionally read through the
+# gateway's quota/fetch plugin endpoint. This replaces the direct upstream
+# polling: the gateway is the single source of truth for "what do I have and
+# how much is left".
+
+CPA_QUOTA_PROVIDERS = ("deepseek", "minimax", "opencode-go", "zai")
+
+
+def cpa_bases(cfg):
+    c = cfg.get("cpa") or {}
+    bases = [c.get("base", "http://10.8.0.3:8317")]
+    wb = c.get("work_base")
+    if wb:
+        bases.append(wb)
+    return bases
+
+
+def cpa_label(entry):
+    name = entry.get("name") or entry.get("id") or ""
+    acct = entry.get("account") or ""
+    if name.startswith("claude"):
+        for needle, label in (("seed28", "Claude·work"), ("ottomundo", "Claude·me")):
+            if needle in name or needle in acct:
+                return label
+        return "Claude"
+    if name.endswith("-quota.json"):
+        p = name[: -len("-quota.json")]
+        return {"deepseek": "DeepSeek", "minimax": "MiniMax",
+                "opencode-go": "Go", "zai": "Z.AI"}.get(p, p)
+    if name.startswith("codex"):
+        return "Codex"
+    if name.startswith("antigravity"):
+        return "Antigravity"
+    if name.startswith("kimi"):
+        return "Kimi·oauth"
+    return name.replace(".json", "") or "CPA"
+
+
+def cpa_headers():
+    return {"Authorization": f"Bearer {os.environ.get('CLIPROXY_MGMT_KEY', '')}"}
+
+
+def cpa_windows_from_signals(signals):
+    """Anthropic-style ratelimit signals CPA stored on the auth: pairs of
+    <base>-Utilization (0..1) and <base>-Reset (epoch s or ms)."""
+    wins = []
+    for key in sorted(signals or {}):
+        if not key.endswith("-Utilization"):
+            continue
+        base = key[: -len("-Utilization")]
+        try:
+            used = pct(float(signals[key]) * 100)
+        except (TypeError, ValueError):
+            continue
+        reset = epoch_of(signals.get(base + "-Reset"))
+        if reset is None:  # epoch as a bare numeric string
+            try:
+                reset = float(signals.get(base + "-Reset"))
+            except (TypeError, ValueError):
+                reset = None
+        tail = base.rsplit("-", 1)[-1].lower()
+        label = {"5h": "5h", "7d": "week"}.get(tail, tail or "win")
+        wins.append((label, used, fmt_ts(reset), reset))
+    return wins
+
+
+def cpa_quota_windows(payload):
+    """quota/fetch plugin result → windows. Buckets carry remainingFraction;
+    the bar shows USED (inverted), matching every other provider here."""
+    wins = []
+    extras = []
+    sub = (payload or {}).get("subscription") or {}
+    if sub.get("plan"):
+        extras.append(f"plan: {sub['plan']}")
+    for g in (payload or {}).get("groups") or []:
+        for b in g.get("buckets") or []:
+            rem = b.get("remainingFraction")
+            if rem is None:
+                continue
+            used = pct(100.0 - float(rem) * 100.0)
+            reset = b.get("resetTime") or ""
+            desc = b.get("description") or ""
+            label = b.get("window") or "win"
+            wins.append((label, used, fmt_ts(reset), epoch_of(reset)))
+            if desc and desc not in extras:
+                extras.append(desc)
+    for m in (payload or {}).get("summary") or []:
+        if m.get("label") and m.get("value") is not None:
+            fmt = m.get("format")
+            val = (f"{m['value']:,.2f}" if fmt == "currency"
+                   else f"{m['value']:,.0f}")
+            extras.append(f"{m['label']}: {val}")
+    return wins, extras
+
+
+def provider_cpa(cfg):
+    bases = cpa_bases(cfg)
+    headers = cpa_headers()
+    entries, gateway_notes = [], []
+    for i, base in enumerate(bases):
+        try:
+            _, d = http_json(f"{base}/v0/management/auth-files", headers)
+        except urllib.error.HTTPError as e:
+            gateway_notes.append(f"gateway {i + 1}: HTTP {e.code}")
+            continue
+        except Exception as e:
+            gateway_notes.append(f"gateway {i + 1}: {e}")
+            continue
+        for e in d.get("auth_files") or d.get("files") or []:
+            e = dict(e)
+            e["_base"] = base
+            e["_idx"] = i
+            entries.append(e)
+    if not entries:
+        note = "; ".join(gateway_notes) or "no auth files returned"
+        return [item("cpa", "CPA", "quota", [], error=f"gateway unreachable ({note})")]
+
+    # Quota-plugin lookups need one POST per *-quota.json auth.
+    quota_payloads = {}
+    for e in entries:
+        name = e.get("name") or ""
+        if not name.endswith("-quota.json"):
+            continue
+        p = name[: -len("-quota.json")]
+        if p not in CPA_QUOTA_PROVIDERS:
+            continue
+        try:
+            req = urllib.request.Request(
+                f"{e['_base']}/v0/management/quota/fetch",
+                data=json.dumps({"provider": p,
+                                 "auth_index": e.get("auth_index")}).encode(),
+                headers={**headers, "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                body = json.loads(r.read().decode("utf-8", "replace"))
+            if isinstance(body, dict) and body.get("error"):
+                quota_payloads[name] = {"error": body["error"]}
+            else:
+                quota_payloads[name] = body
+        except Exception as ex:
+            quota_payloads[name] = {"error": str(ex)}
+
+    items = []
+    for e in entries:
+        name = e.get("name") or e.get("id") or "cpa-auth"
+        pid = f"cpa:{name}"
+        label = cpa_label(e)
+        extras = []
+        cooldowns = e.get("cooldowns") or []
+        for cd in cooldowns:
+            retry = epoch_of(cd.get("retry_at"))
+            if retry:
+                extras.append(f"cooldown → {fmt_ts(retry)} (in {fmt_in(retry)})")
+        if e.get("unavailable"):
+            msg = (e.get("status_message") or "")
+            try:
+                msg = json.loads(msg).get("error", {}).get("message", msg)
+            except Exception:
+                pass
+            extras.append(f"unavailable: {str(msg)[:120]}" if msg else "unavailable")
+        if name.endswith("-quota.json") and name in quota_payloads:
+            payload = quota_payloads[name]
+            if payload.get("error"):
+                wins = []
+                extras.append(f"quota: {str(payload['error'])[:100]}")
+            else:
+                wins, qex = cpa_quota_windows(payload)
+                extras += [x for x in qex if x not in extras]
+        else:
+            wins = cpa_windows_from_signals((e.get("quota") or {}).get("signals")
+                                            or e.get("signals") or {})
+            if not wins and not e.get("unavailable"):
+                extras.append("no usage observed yet")
+        if e.get("_idx") == 1:
+            extras.append("gateway: work (:8318)")
+        items.append(item(pid, label, "quota", wins, error=None,
+                          extra=extras))
+    if gateway_notes:
+        items[0]["extra"] = (["gateway note: " + n for n in gateway_notes]
+                             + items[0].get("extra", []))
+    return items
+
+
+PROVIDERS = [("cpa", "C"), ("anthropic", "A"), ("codex", "X"), ("zai", "Z"),
+             ("kimi", "K"), ("minimax", "M"), ("deepseek", "D"),
+             ("opencode", "O"), ("cursor", "U")]
 
 
 def gather(cfg, state):
     out = []
     for pid, _ in PROVIDERS:
         if not enabled(pid, cfg):
+            continue
+        if pid == "cpa":
+            out.extend(fetch_cached("cpa", lambda: provider_cpa(cfg)))
             continue
         if pid == "deepseek":
             r = fetch_cached(pid, lambda: provider_deepseek(state))
@@ -946,6 +1161,48 @@ def selftest():
             r2 = render(its, cfgc)
             assert r2["text"].startswith(("Claude:", "Codex:"))  # auto-rotation
             assert "click or scroll" not in r2["tooltip"]
+        finally:
+            CACHE_DIR = _orig
+    # CPA: claude ratelimit signals → used windows (5h + week)
+    sig = {"Anthropic-Ratelimit-Unified-5h-Utilization": "0.0",
+           "Anthropic-Ratelimit-Unified-5h-Reset": "1795506600",
+           "Anthropic-Ratelimit-Unified-7d-Utilization": "1.0",
+           "Anthropic-Ratelimit-Unified-7d-Reset": "1795705200"}
+    cw = cpa_windows_from_signals(sig)
+    assert [w[0] for w in cw] == ["5h", "week"]
+    assert cw[0][1] == 0.0 and cw[1][1] == 100.0
+    assert cw[1][3] == 1795705200.0
+    # CPA: quota plugin buckets carry remainingFraction → inverted to used
+    q = {"subscription": {"plan": "OpenCode Go"},
+         "groups": [{"displayName": "OpenCode Go", "buckets": [
+             {"window": "5h", "remainingFraction": 0.94,
+              "resetTime": "2026-11-24T07:21:58Z",
+              "description": "5-hour window · 6% used"},
+             {"window": "week", "remainingFraction": 0.98,
+              "resetTime": "2026-11-30T00:00:00Z", "description": ""}]}]}
+    qw, qe = cpa_quota_windows(q)
+    assert [w[0] for w in qw] == ["5h", "week"]
+    assert qw[0][1] == 6.0 and qw[1][1] == 2.0
+    assert any("OpenCode Go" in x for x in qe) and any("6% used" in x for x in qe)
+    # CPA: labels disambiguate the two claude accounts + quota keys
+    assert cpa_label({"name": "claude-31042554-otto@seed28.com.json"}) == "Claude·work"
+    assert cpa_label({"name": "claude-7bb54e4e-octavio@ottomundo.com.ar.json"}) == "Claude·me"
+    assert cpa_label({"name": "opencode-go-quota.json"}) == "Go"
+    assert cpa_label({"name": "codex-a95af962-octavio@ottomundo.com.ar-pro.json"}) == "Codex"
+    # fetch_cached stale fallback works for list-shaped results too
+    with tempfile.TemporaryDirectory() as td3:
+        CACHE_DIR = Path(td3)
+        try:
+            cache_put("cpa", [{"id": "cpa:x", "label": "X", "kind": "quota",
+                               "windows": [("5h", 1.0, "")], "level": OK,
+                               "error": None, "extra": [], "currency": "USD"}])
+            # age the cache past MIN_INTERVALS so the stale path triggers
+            cp = CACHE_DIR / "cpa.json"
+            d = json.loads(cp.read_text())
+            d["ts"] -= 10 ** 6
+            cp.write_text(json.dumps(d))
+            got = fetch_cached("cpa", lambda: {"error": "gateway down"})
+            assert isinstance(got, list) and got[0].get("stale") is True
         finally:
             CACHE_DIR = _orig
     # deepseek money level

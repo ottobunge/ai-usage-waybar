@@ -60,7 +60,20 @@ re-arms after recovery.
 Keys are read from env vars, falling back to opencode's `auth.json`
 (`~/.local/share/opencode/auth.json`). Nothing is stored in this repo.
 
-| Provider | Needs | Where to get it | Notes |
+### CPA mode (default when `CLIPROXY_MGMT_KEY` is set)
+
+With the CPA management key in the env, the `cpa` provider replaces the
+direct-poll set above: one poll of the gateway's management API
+(`/v0/management/auth-files` on the personal and work gateways, plus
+`/v0/management/quota/fetch` per quota-key auth) yields an item for **every
+auth on the fleet gateway** — both Claude accounts (work + personal), Codex,
+Antigravity, the Kimi OAuth login, and the Z.AI / MiniMax / DeepSeek /
+OpenCode-Go quota keys — with availability, cooldowns, and usage windows
+exactly as the gateway observed them. Carousel ids are `cpa:<auth-file>`;
+the legacy direct-poll providers stay available but default off in this
+mode (they would double-poll upstreams the gateway already watches).
+
+| Provider (legacy, CPA off) | Needs | Where to get it | Notes |
 |---|---|---|---|
 | Anthropic | nothing extra | run `claude` once (OAuth file read directly) | unofficial usage endpoint, cached ≥5 min (it rate-limits hard) |
 | Codex | nothing extra | run `codex login` | same endpoint the Codex CLI polls; also shows credit balance |
